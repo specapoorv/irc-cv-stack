@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['cone']
+
+roboflow:
+  workspace: myws-54psx
+  project: cone-detection-e4qqb
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/myws-54psx/cone-detection-e4qqb/dataset/2
