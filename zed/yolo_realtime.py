@@ -4,7 +4,7 @@ from ultralytics import YOLO
 import pyzed.sl as sl
 
 # ---- Settings ----
-MODEL_PATH = "/home/specapoorv/irc-cv-stack/weights/model2.pt"      # path to YOLO model
+MODEL_PATH = "irc-cv-stack/weights/model2.pt"      # path to YOLO model
 INFERENCE_RATE = 5              # Hz (YOLO runs every N frames per second)
 DISPLAY = True                  # show realtime visualization
 SAVE_OUTPUT = False             # set True to save output video
