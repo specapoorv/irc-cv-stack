@@ -6,11 +6,10 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import Int8, Bool, Float32MultiArray
 
 
-class AutonomousControl(Node):
+class GoToCone(Node):
     def __init__(self):
-        super().__init__("autonomous_control_node")
-        
-        # QoS
+        super().__init__("go_to_cone_node")
+
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
         # Publishers
@@ -39,8 +38,8 @@ class AutonomousControl(Node):
         self.forward_speed = 30           # linear speed
         self.center_align_threshold = 40  # pixels
         self.image_width = 1280
-        self.image_height = 720           # set correctly
-        self.goal_depth = 0.50            # stop when < 0.5 m
+        self.image_height = 720           
+        self.goal_depth = 0.50            #when to stop
 
         self.timer = self.create_timer(0.1, self.timer_callback)
 
@@ -52,24 +51,20 @@ class AutonomousControl(Node):
 
 
     def yolo_callback(self, msg: Float32MultiArray):
-        # The message must contain exactly 4 pixel values.
-        if msg is None or msg.data is None or len(msg.data) < 5:
-            return
 
-        # Extract pixel values
+        
+
         cx, cy, w, h, depth = msg.data
 
-        # Convert to floats (ensure clean)
         cx = float(cx)
         cy = float(cy)
         w  = float(w)
         h  = float(h)
         depth = float(depth)
 
-        # Save data
         new_data = (cx, cy, w, h, depth)
 
-        current_time = self.get_clock().now()
+        current_time = self.get_clock().now() #timestampt time.time() wont work
 
         # First time
         if self.last_yolo_update is None:
@@ -77,18 +72,17 @@ class AutonomousControl(Node):
             self.last_yolo_data = new_data
             self.have_yolo = True
         else:
-            # Check if values changed compared to last frame
+            #check if values changed
             if new_data != self.last_yolo_data:
-                self.last_yolo_update = current_time     # update timestamp
-                self.last_yolo_data = new_data           # store new sample
+                self.last_yolo_update = current_time     #update timestamp
+                self.last_yolo_data = new_data           
                 self.have_yolo = True
             else:
-                # If unchanged for more than 2 seconds → fail
+                #if didnt change, do search
                 time_diff = (current_time - self.last_yolo_update).nanoseconds / 1e9
                 if time_diff > 2.0:
                     self.have_yolo = False
 
-        # Store bounding box for use in main control loop
         self.cx, self.cy, self.w, self.h, self.depth = new_data
 
 
@@ -120,7 +114,7 @@ class AutonomousControl(Node):
             twist = Twist()
             twist.linear.x = self.forward_speed
             self.twist_pub.publish(twist)
-            self.get_logger().info("NO YOLO → driving straight")
+            self.get_logger().warn("NO YOLO = driving straight")
             return
         
         aligned = self.align_to_cone()
@@ -131,7 +125,7 @@ class AutonomousControl(Node):
 
         if self.depth is not None:
             if self.depth < self.goal_depth:
-                self.get_logger().info("REACHED CONE → stopping")
+                self.get_logger().info("REACHED CONE = stopping")
                 self.twist_pub.publish(Twist())
                 return
 
@@ -143,7 +137,7 @@ class AutonomousControl(Node):
 
 def main(args=None):
     r.init(args=args)
-    node = AutonomousControl()
+    node = GoToCone()
     try:
         r.spin(node)
     except KeyboardInterrupt:
