@@ -9,23 +9,35 @@ import numpy as np
 from ultralytics import YOLO
 import torch
 import csv
+from datetime import date
+import os
 
-class YOLO(Node):
+#color for coloured prints brooo!!!
+RESET = "\033[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+MAGENTA = "\033[95m"
+BOLD = "\033[1m"
+
+
+class YoloPub(Node):
     def __init__(self):
         super().__init__("yolo_publisher")
 
         self.bridge = CvBridge()
 
-        self.model = YOLO("./weights/model_old.pt")
+        self.model = YOLO("./model_inside.pt")
         self.model.to("cuda")
         print(torch.cuda.is_available())
         self.get_logger().warn(f"[DEPLOY] yolo deployed on device : {self.model.device} succesfully!")
 
 
-        self.sub_left = self.create_subscription(Image, "/zed/zed_node/left/image_rect_color", self.left_callback, 10)
+        self.sub_left = self.create_subscription(Image, "/zed/zed_node/rgb/color/rect/image", self.left_callback, 10)
         self.sub_depth = self.create_subscription(Image, "/zed/zed_node/depth/depth_registered", self.depth_callback, 10)
         self.sub_state = self.create_subscription(Bool, "/state", self.state_callback, 10)
-        self.sub_gps = self.create_subscription(NavSatFix, "/gps_topic", self.gps_callback, self.qos)
+        self.sub_gps = self.create_subscription(NavSatFix, "/gps/fix", self.gps_callback, 10)
 
         self.log_service = self.create_service(Trigger, "log_service", self.log_callback)
 
@@ -38,7 +50,8 @@ class YOLO(Node):
         self.object_number = 1
         self.gps = None
         self.state = False
-
+        self.save_data = []
+        self.last_state = None
                   
                   
 
@@ -49,15 +62,16 @@ class YOLO(Node):
         self.depth_frame = self.bridge.imgmsg_to_cv2(msg, msg.encoding)  
     
     def gps_callback(self, msg : NavSatFix):
-        self.gps = msg
+        self.gps = msg.data
 
-    def log_callback(self, response):
+    def log_callback(self, request, response):
         
         self.process()
 
         if len(self.save_data) == 0:
             response.success = False
             response.message = "CONE NOT DETECTED, move rover little away from cone"
+            return response
 
         self.get_logger().info("Preparing to log color.....")
 
@@ -67,40 +81,52 @@ class YOLO(Node):
             z = data[2]
             if i==0:
                 min_z = z
+                cone_to_log_idx = 0
             if z > 0 and z < min_z:
                 min_z = z
                 cone_to_log_idx = i 
 
-        H, S, V = self.save_data[cone_to_log_idx][3:]
+        cx, cy, z, H, S, V = self.save_data[cone_to_log_idx]
 
         self.get_logger().info("Preparing to log GPS coords.....")
         if self.gps is None:
             self.get_logger().warn("Not getting GPS from topic, GPS message is still None!!!")
-            return
-
-        latitude = self.gps.latitude
-        longitude = self.gps.longitude
+            latitude = 0.0
+            longitude = 0.0
+        else:
+            latitude = self.gps.latitude
+            longitude = self.gps.longitude
 
         self.get_logger().info(f"Logging object_number {self.object_number} at GPS ({latitude}, {longitude})!")
         self.get_logger().info(f"Logging color H={H}, S={S}, V={V}")
 
-
-        with open("log.csv", "a", newline="") as f:
+        today = date.today()
+        file_path = f"/home/orin/log_{today}.csv"
+        file_exists = os.path.exists(file_path)
+        with open(file_path, "a", newline="") as f:
             writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow(["object_number", "latitude", "longitude", "H", "S", "V"])
+
             writer.writerow([self.object_number, latitude, longitude, H, S, V])
 
 
         self.object_number += 1
 
-        self.get_logger().info("ONE STEP CLOSER TO WINNING IRC LETS GO!!!")
+        self.get_logger().info(f"{GREEN}{BOLD}ONE STEP CLOSER TO WINNING IRC LETS GO!!!{RESET}")
 
-
+        self.show_popup(self.left_frame, cx, cy, H, S, V)
+        
         response.success = True
         response.message = "logged sucessfully"
+
+
         return response
     
+    
     def state_callback(self, msg):
-        self.state = msg
+        self.state = msg.data
 
 
     def process(self):
@@ -113,7 +139,7 @@ class YOLO(Node):
         results = self.model(frame)[0]
 
         if len(results.boxes) == 0:
-            self.get_logger().warn("[MODEL] 😢 i dont see any cone bro i am blind")
+            self.get_logger().warn(f"{YELLOW}[MODEL] 😢 i dont see any cone bro i am blind{RESET}")
             return
 
         all_bbox_per_frame = []
@@ -153,39 +179,98 @@ class YOLO(Node):
 
         msg = Float32MultiArray()
         msg.data = [item for cone in all_bbox_per_frame for item in cone]  # flatten
-        self.save_data = all_bbox_per_frame #saving to write in csv if service requests
+        self.save_data = all_bbox_per_frame.copy() #saving to write in csv if service requests
 
-        num_cones = len(all_bbox_per_frame) // 6
+        num_cones = len(all_bbox_per_frame)
         if num_cones > 10:
-            self.get_logger().info("o shit it detected more than 10 cones 💀")
+            self.get_logger().info(f"{RED}o shit it detected more than 10 cones 💀{RESET}")
+            #add a logi here to not publish something like this or publish something like model failed so control loop can fallback safely
             return
         
         self.pub.publish(msg)
-        self.get_logger().warn(f"[MODEl] 🥳 deteced {num_cones} cones")
+        self.get_logger().info(f"{GREEN}[MODEl] 🥳 deteced {num_cones} cones{RESET}")
+        
+
+    def show_popup(self, frame, cx, cy, H, S, V):
+        frame_disp = frame.copy()
+
+        # Draw red dot at cone center
+        cv2.circle(frame_disp, (int(cx), int(cy)), 8, (0, 0, 255), -1)
+
+        # --- Create color patch ---
+        patch_color = np.uint8([[[H, S, V]]])
+        patch_bgr = cv2.cvtColor(patch_color, cv2.COLOR_HSV2BGR)[0][0].tolist()
+
+        legend_x = 20
+        legend_y = 20
+
+        # Legend background
+        cv2.rectangle(frame_disp,
+                    (legend_x - 10, legend_y - 10),
+                    (legend_x + 200, legend_y + 70),
+                    (30, 30, 30),
+                    -1)
+
+        # Color patch square
+        cv2.rectangle(frame_disp,
+                    (legend_x, legend_y),
+                    (legend_x + 50, legend_y + 50),
+                    patch_bgr,
+                    -1)
+
+        # HSV text
+        text = f"H:{H:.1f}  S:{S:.1f}  V:{V:.1f}"
+        cv2.putText(frame_disp,
+                    text,
+                    (legend_x + 60, legend_y + 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA)
+
+        # LOGGED message
+        cv2.putText(frame_disp,
+                    "LOGGED!",
+                    (legend_x, legend_y + 85),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA)
+
+        cv2.imshow("LOG CONFIRMATION", frame_disp)
+
+        # wait 1 ms for key press
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):  # press 'q' to close window
+            cv2.destroyWindow("LOG CONFIRMATION")
+
+
 
 
     
     def timer_callback(self):
         if self.left_frame is None:
-            self.get_logger().info("[WAITING] for zed boi to give frames")
+            self.get_logger().info(f"{CYAN}[WAITING] for zed boi to give frames, TURN ON ZEDWRAPPER{RESET}")
             return
         if self.depth_frame is None:
             self.get_logger().info("[WAITING] for zed depth image")
             return
         
-        if self.state:
-            self.get_logger().info("[AUTONOMOUS]")           
-            self.process()
-        
-        if not self.state:
-            self.get_logger().info("[MANUAL]")
+        if self.state != self.last_state:
+            if self.state:
+                self.get_logger().info(f"{MAGENTA}{BOLD}[AUTONOMOUS MODE]{RESET}")
+            else:
+                self.get_logger().info(f"{RED}{BOLD}[MANUAL MODE]{RESET}")
+            self.last_state = self.state
 
 
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = YOLO()
+    node = YoloPub()
     rclpy.spin(node)
     rclpy.shutdown()
 
