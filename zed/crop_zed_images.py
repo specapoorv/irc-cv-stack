@@ -2,8 +2,8 @@ import cv2
 import os
 
 # Input and output directories
-input_dir = "dataset"
-output_dir = "dataset_2"
+input_dir = "/home/specapoorv/irc-cv-stack/data/ZED"
+output_dir = "/home/specapoorv/irc-cv-stack/data/ZED_cropped"
 os.makedirs(output_dir, exist_ok=True)
 
 # Supported image extensions
@@ -23,7 +23,7 @@ for filename in sorted(os.listdir(input_dir)):
 
     h, w, _ = img.shape
 
-    if w != 4416:
+    if w != 2560:
         print(f"⚠️ Skipping {filename} — expected width 4416, got {w}")
         continue
 
