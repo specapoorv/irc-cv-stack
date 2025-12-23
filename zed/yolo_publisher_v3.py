@@ -8,6 +8,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image as PILImage
 import csv
 from datetime import date
 import os
@@ -22,6 +25,20 @@ CYAN = "\033[96m"
 MAGENTA = "\033[95m"
 BOLD = "\033[1m"
 
+class CNN1(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)
+        )
+
+    def forward(self, x):
+        x = self.net(x)
+        return x.view(x.size(0), -1)
+
 
 class YoloPub(Node):
     def __init__(self):
@@ -29,10 +46,25 @@ class YoloPub(Node):
 
         self.bridge = CvBridge()
 
-        self.model = YOLO("./model_inside.pt")
+        self.model = YOLO("./weights/model_inside.pt")
         self.model.to("cuda")
         print(torch.cuda.is_available())
         self.get_logger().warn(f"[DEPLOY] yolo deployed on device : {self.model.device} succesfully!")
+
+        # Load encoder checkpoint
+        self.encoder = CNN1().to("cuda")
+        checkpoint_path = "./weights/simclr_checkpoint_20dec_730.pth"
+        checkpoint = torch.load(checkpoint_path)
+        self.encoder.load_state_dict(checkpoint['encoder'])
+        self.encoder.eval()
+        self.get_logger().warn(f"[DEPLOY] SimCLR encoder deployed on device : {self.model.device} succesfully!")
+
+        # Transform for encoder
+        self.transform = transforms.Compose([
+            transforms.Resize(224),
+            transforms.CenterCrop(224),
+            transforms.ToTensor()
+        ])
 
 
         self.sub_left = self.create_subscription(Image, "/zed/zed_node/rgb/color/rect/image", self.left_callback, 10)
@@ -56,6 +88,9 @@ class YoloPub(Node):
 
         today = date.today()
         self.file_path = f"/home/orin/log_{today}.csv"
+
+        self.embedding_to_go_to = None
+        self.hue_to_go_to = None
                   
     def left_callback(self, msg):
         self.left_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -69,15 +104,56 @@ class YoloPub(Node):
     def gps_callback(self, msg : NavSatFix):
         self.gps = msg
 
+    def get_embedding(self, cropped_image):
+        """Get embedding for cropped cone image"""
+        if cropped_image is None or cropped_image.size == 0:
+            return None
+        
+        try:
+            # Convert to PIL
+            image_rgb = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
+            pil_img = PILImage.fromarray(image_rgb)
+            
+            # Transform and get embedding
+            img_tensor = self.transform(pil_img).unsqueeze(0).to("cuda")
+            
+            with torch.no_grad():
+                embedding = self.encoder(img_tensor).cpu().numpy()[0]
+            
+            embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+            return embedding
+        
+        except Exception as e:
+            self.get_logger().error(f"Error getting embedding: {e}")
+            return None
+
+    def compute_similarity(self, emb1, emb2, h1, h2):
+        """Compute weighted similarity (cosine + hue distance)"""
+        if emb1 is None or emb2 is None:
+            return None
+        
+        # Cosine similarity
+        cosine_similarity = np.dot(emb1, emb2)
+        
+        # Hue distance (normalized)
+        dist = min(abs(h2 - h1), 360 - abs(h2 - h1))
+        dist_normalized = dist / 180.0
+        
+        # Weighted combination
+        similarity = (0.6 * cosine_similarity) + (0.4 * (1.0 - dist_normalized))
+        
+        return similarity
+
     def log_callback(self, request, response):
         
         self.process()
 
         if len(self.save_data) == 0:
-            #response.success = False
-            #response.message = "CONE NOT DETECTED, move rover little away from cone"
-            #return response
-            pass
+            response.success = False
+            response.message = "CONE NOT DETECTED, move rover little away from cone"
+            self.get_logger().info(f"{RED}Service called but no cones detected{RESET")
+
+            return response
 
         self.get_logger().info("Preparing to log color.....")
 
@@ -92,7 +168,7 @@ class YoloPub(Node):
                 min_z = z
                 cone_to_log_idx = i 
 
-        cx, cy, z, H, S, V = self.save_data[cone_to_log_idx]
+        cx, cy, z, H, embedding = self.save_data[cone_to_log_idx]
 
         self.get_logger().info("Preparing to log GPS coords.....")
         if self.gps is None:
@@ -104,7 +180,10 @@ class YoloPub(Node):
             longitude = self.gps.longitude
 
         self.get_logger().info(f"Logging object_number {self.object_number} at GPS ({latitude}, {longitude})!")
-        self.get_logger().info(f"Logging color H={H}, S={S}, V={V}")
+        self.get_logger().info(f"Logging color H={H}, and embedding")
+
+        embedding_str = ','.join(map(str, embedding.tolist()))
+
 
 
         file_exists = os.path.exists(self.file_path)
@@ -112,9 +191,9 @@ class YoloPub(Node):
             writer = csv.writer(f)
 
             if not file_exists:
-                writer.writerow(["object_number", "latitude", "longitude", "H", "S", "V"])
+                writer.writerow(["object_number", "latitude", "longitude", "H", "embedding"])
 
-            writer.writerow([self.object_number, latitude, longitude, H, S, V])
+            writer.writerow([self.object_number, latitude, longitude, H, embedding_str])
 
 
         self.object_number += 1
@@ -147,6 +226,11 @@ class YoloPub(Node):
 
         return dot_product / (magnitude_a * magnitude_b)
     
+    def reset_target(self):
+        """Call this after successful delivery to find next target"""
+        self.embedding_to_go_to = None
+        self.hue_to_go_to = None
+    
 
     def process(self):
         '''
@@ -161,7 +245,7 @@ class YoloPub(Node):
         results = self.model(frame)[0]
 
         if len(results.boxes) == 0:
-            self.get_logger().warn(f"{YELLOW}[MODEL] 😢 i dont see any cone bro i am blind{RESET}")
+            self.get_logger().info(f"{YELLOW}[MODEL] 😢 i dont see any cone bro i am blind{RESET}")
             return
 
         all_bbox_per_frame = []
@@ -172,6 +256,11 @@ class YoloPub(Node):
             cy = int((ymin + ymax) / 2)
             w = xmax - xmin
             h = ymax - ymin
+
+            cropped = frame[ymin:ymax, xmin:xmax]
+
+            embedding = self.get_embedding(cropped)
+
             dpatch = depth[cy-2:cy+3, cx-2:cx+3]
             dpatch = dpatch[np.isfinite(dpatch)]
             if len(dpatch) == 0:
@@ -198,7 +287,7 @@ class YoloPub(Node):
             S = float(np.mean(hsv_roi[:, :, 1]))
             V = float(np.mean(hsv_roi[:, :, 2]))
 
-            all_bbox_per_frame.append([float(cx), float(cy), z, H, S, V])
+            all_bbox_per_frame.append([float(cx), float(cy), z, H, embedding])
 
         self.save_data = all_bbox_per_frame.copy() #saving to write in csv if service requests and will be used in publishing
 
@@ -209,6 +298,32 @@ class YoloPub(Node):
         #     return
         
         self.get_logger().info(f"{GREEN}[MODEl] 🥳 deteced {num_cones} cones{RESET}")
+
+    def get_embedding_to_go_to(self):
+        curr_lat = self.gps.latitude
+        curr_lon = self.gps.longitude
+        gps = [curr_lat, curr_lon]
+        min_distance = float("inf")
+        embedding_to_go_to = []
+        hue_to_go_to = []
+        with open(self.file_path, newline="") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                object_number = int(row["object_number"])
+                lat = float(row["latitude"])
+                lon = float(row["longitude"])
+                gps_log = [lat, lon]
+                H = float(row["H"])
+                embedding = np.array([float(x) for x in row["embedding"].split(',')])
+                dist = self.euclidean(gps, gps_log)
+                if dist < min_distance:
+                    min_distance = dist
+                    embedding_to_go_to = embedding.copy()
+                    hue_to_go_to = H
+        
+        return embedding_to_go_to, hue_to_go_to
+
 
     def get_hsv_to_go_to(self):
         curr_lat = self.gps.latitude
@@ -234,25 +349,32 @@ class YoloPub(Node):
                     min_distance = dist
                     hsv_to_go_to = hsv.copy()
 
-            return hsv_to_go_to
+        return hsv_to_go_to
 
 
     def msg_publisher(self):
         #now we will go in all bbox per frame and take the cone with lowest z value and match with hsv as well
         #based on the log_file.csv closest gps coords will be selected and then its hsv will be noted now that hsv will be used to find for all the cones until you reach to the cone and deliver
-        if hsv_to_go_to is None:
-            hsv_to_go_to = self.get_hsv_to_go_to #we have to reset this as well 
+        if self.embedding_to_go_to is None:
+            self.embedding_to_go_to, self.hue_to_go_to = self.get_embedding_to_go_to() #we have to reset this as well which we did while turning into manual mode 
 
-        #now we will filter all bbox per frame, such that only bbox whose hsvs lie within a threshold (cosine similarity) exist and then just pick the lowest z valu
-        cosine_thres = 0.5
+        #NOTE : if you press manual mode from some random place it will take embedding of the closest cone from that random GPS 
+
+        #now we will filter all bbox per frame, such that only bbox whose embedding lie within a threshold (cosine similarity) exist and then just pick the lowest z valu
+        similarity_thres = 0.5
         filterd_bbox_per_frame = []
         for i, cone in enumerate(self.save_data):
-            current_hsv = [cone[3], cone[4], cone[5]]
-            current_cosine_similarity = self.get_cosine_similarity(hsv_to_go_to, current_hsv)
-            if current_cosine_similarity > cosine_thres:
-                filterd_bbox_per_frame.append([cone[0], cone[1], cone[2]])
+            cx, cy, z, embedding, H = cone
+            current_similarity = self.compute_similarity(self.embedding_to_go_to, embedding, self.hue_to_go_to, H)
+            if current_similarity > similarity_thres:
+                filterd_bbox_per_frame.append([cx, cy, z, current_similarity])
+
+        if len(filterd_bbox_per_frame) == 0:
+            self.get_logger().info(f"{RED}No matching cones found after filtering{RESET}")
+            return
             
         min_z = float("inf")
+        min
         chosen_cx = None
         chosen_cy = None
         chosen_depth = None
@@ -280,11 +402,17 @@ class YoloPub(Node):
         if self.state != self.last_state:
             if self.state:
                 self.get_logger().info(f"{MAGENTA}{BOLD}[AUTONOMOUS MODE]{RESET}")
-                self.process()
-                self.msg_publisher()
+                self.embedding_to_go_to, self.hue_to_go_to = self.get_embedding_to_go_to()
+
             else:
                 self.get_logger().info(f"{RED}{BOLD}[MANUAL MODE]{RESET}")
+                self.reset_target() #resets embedding_to_go_to
+
             self.last_state = self.state
+
+        if self.state:
+                self.process()
+                self.msg_publisher()
 
     #Visuals
     def show_popup(self, frame, cx, cy, H, S, V):
