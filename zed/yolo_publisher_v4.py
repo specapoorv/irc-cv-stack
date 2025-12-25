@@ -16,6 +16,7 @@ import csv
 from datetime import date
 import os
 import math
+from collections import deque
 
 #colour for coloured prints brooo!!!
 RESET = "\033[0m"
@@ -107,7 +108,7 @@ class YoloPub(Node):
         self.class_names = ['blue', 'cyan', 'green', 'orange', 'red', 'yellow']
 
 
-        self.sub_left = self.create_subscription(Image, "/zed/zed_node/rgb/colour/rect/image", self.left_callback, 10)
+        self.sub_left = self.create_subscription(Image, "/zed/zed_node/rgb/color/rect/image", self.left_callback, 10)
         self.sub_depth = self.create_subscription(Image, "/zed/zed_node/depth/depth_registered", self.depth_callback, 10)
         self.sub_state = self.create_subscription(Bool, "/state", self.state_callback, 10)
         self.sub_gps = self.create_subscription(NavSatFix, "/gps/fix", self.gps_callback, 10)
@@ -127,6 +128,7 @@ class YoloPub(Node):
         self.state = False
         self.save_data = []
         self.last_state = None
+        self.depth_queue = deque(maxlen=10)
 
         today = date.today()
         self.file_path = f"/home/orin/log_{today}.csv"
@@ -134,25 +136,29 @@ class YoloPub(Node):
         self.colour_to_go_to = None
 
 
-                  
     def left_callback(self, msg):
-        self.left_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        try:
+            self.left_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().warn(f"Exception: {e}")
 
     def depth_callback(self, msg):
-        self.depth_frame = self.bridge.imgmsg_to_cv2(msg, msg.encoding)  
+        try:
+            self.depth_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")  
+        except Exception as e:
+            self.get_logger().warn(f"Exception: {e}")
     
     def state_callback(self, msg):
         self.state = msg.data
     
     def gps_callback(self, msg : NavSatFix):
-        self.gps = msg
+        if msg is not None:
+            self.gps = msg
 
-        
     def classify_colour_with_retinex(self, cropped_image):
         """Classify colour of cropped cone image using Retinex preprocessing"""
         if cropped_image is None or cropped_image.size == 0:
             return None, None
-        
         
         try:
             # Apply Retinex preprocessing
@@ -191,7 +197,7 @@ class YoloPub(Node):
         self.get_logger().info("Preparing to log colour.....")
 
         min_z = None
-        cone_to_log_idx: int = None
+        cone_to_log_idx = None
         for i, data in enumerate(self.save_data):
             z = data[2]
             if i==0:
@@ -200,6 +206,9 @@ class YoloPub(Node):
             if z > 0 and z < min_z:
                 min_z = z
                 cone_to_log_idx = i 
+
+        if cone_to_log_idx is None:
+            self.get_logger().info("That thing that was None is now None")
 
         cx, cy, z, colour_name, colour_conf = self.save_data[cone_to_log_idx]
 
@@ -225,7 +234,6 @@ class YoloPub(Node):
 
             writer.writerow([self.object_number, latitude, longitude, colour_name, colour_conf])
 
-
         self.object_number += 1
 
         self.get_logger().info(f"{GREEN}{BOLD}ONE STEP CLOSER TO WINNING IRC LETS GO!!!{RESET}")
@@ -234,8 +242,6 @@ class YoloPub(Node):
         
         response.success = True
         response.message = "logged sucessfully"
-
-
         return response
     
     def colour_override_callback(self, params):
@@ -254,8 +260,8 @@ class YoloPub(Node):
 
     #HELPERS
     
-    def euclidean(self, p, q):
-        return sum((a - b) ** 2 for a, b in zip(p, q))
+    # def euclidean(self, p, q):
+    #     return sum((a - b) ** 2 for a, b in zip(p, q))
     
     
     def reset_target(self):
@@ -296,6 +302,7 @@ class YoloPub(Node):
             dpatch = dpatch[np.isfinite(dpatch)]
             if len(dpatch) == 0:
                 continue
+
             z = float(np.median(dpatch))
 
             #if aspect ratio is fcked up, skip
@@ -333,7 +340,8 @@ class YoloPub(Node):
                 gps_log = [lat, lon]
                 colour_name = row["colour_name"]
                 
-                dist = self.euclidean(gps, gps_log)
+                # dist = self.euclidean(gps, gps_log)
+                dist = math.dist(gps, gps_log)
                 if dist < min_distance:
                     min_distance = dist
                     colour_to_go_to = colour_name
@@ -354,14 +362,13 @@ class YoloPub(Node):
             cx, cy, z, colour_name, colour_conf = cone
 
             if colour_name is None:
-                self.get_logger.info(f"{RED}colour name is none{RESET}")
+                self.get_logger().info(f"{RED}colour name is none{RESET}")
                 continue
             
             if colour_name == self.colour_to_go_to and colour_conf > 0.5:
                 filterd_bbox_per_frame.append([cx, cy, z, colour_conf])
 
         #now we will filter all bbox per frame, such that only bbox whose embedding lie within a threshold (cosine similarity) exist and then just pick the lowest z valu
-
 
         if len(filterd_bbox_per_frame) == 0:
             self.get_logger().info(f"{RED}No matching cones found after filtering{RESET}")
@@ -378,9 +385,12 @@ class YoloPub(Node):
                 chosen_cx = cone[0]
                 chosen_cy = cone[1]
                 chosen_depth = cone[2]
+
+        self.depth_queue.append(chosen_depth)
+        chosen_depth_rect = sum(self.depth_queue) / len(self.depth_queue)
     
         msg = Float32MultiArray()
-        msg.data = [chosen_cx, chosen_cy, chosen_depth]
+        msg.data = [chosen_cx, chosen_cy, chosen_depth_rect]
         self.pub.publish(msg)
 
     
@@ -391,7 +401,6 @@ class YoloPub(Node):
         if self.depth_frame is None:
             self.get_logger().info("[WAITING] for zed depth image")
            
-        
         if self.state != self.last_state:
             if self.state:
                 self.get_logger().info(f"{MAGENTA}{BOLD}[AUTONOMOUS MODE]{RESET}")
@@ -403,8 +412,8 @@ class YoloPub(Node):
             self.last_state = self.state
 
         if self.state:
-                self.process()
-                self.msg_publisher()
+            self.process()
+            self.msg_publisher()
 
 def main(args=None):
     rclpy.init(args=args)
