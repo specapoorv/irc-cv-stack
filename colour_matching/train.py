@@ -1,172 +1,266 @@
+import os
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
+from torchvision.utils import save_image
 from PIL import Image
-import os
-import random
+from datetime import datetime
 
-# -----------------------------
-# 1️⃣ Dataset class
-# -----------------------------
-class ConeDataset(Dataset):
-    def __init__(self, img_dir):
-        self.img_dir = img_dir
-        self.img_files = [os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.endswith(".jpg")]
+# =============================
+# CONFIG
+# =============================
+IMG_DIR = "/home/specapoorv/irc-cv-stack/data_colour/dataset"
+EPOCHS = 50
+BATCH_SIZE = 16
+LR = 1e-4
+TEMPERATURE = 0.4
+VAL_SPLIT = 0.1
+DEBUG_EVERY = 5
+DEBUG_K = 5
 
-        # SimCLR-style augmentations (colour-preserving)
-        self.transform = transforms.Compose([
+CHECKPOINT_PATH = "simclr_checkpoint_22dec_800.pth"
+METRICS_PATH = "metrics.json"
+DEBUG_DIR = "debug_samples"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class ColourDataset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, allowed_colors=None, transform=None):
+        if allowed_colors is None:
+            allowed_colors = ["blue","cyan","green","red","yellow","orange"]
+
+        self.color_to_idx = {color: idx for idx, color in enumerate(allowed_colors)}
+        self.imgs_per_color = {color: [] for color in allowed_colors}
+
+        for color in allowed_colors:
+            folder = os.path.join(img_dir, color)
+            if not os.path.exists(folder):
+                continue
+            for img_name in os.listdir(folder):
+                if img_name.lower().endswith(('.png','.jpg','.jpeg')):
+                    self.imgs_per_color[color].append(os.path.join(folder, img_name))
+
+        self.colors = list(self.imgs_per_color.keys())
+        self.transform = transform or transforms.Compose([
             transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0),  # preserve hue
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0),
             transforms.ToTensor()
         ])
 
+        # Flatten list for indexing
+        self.all_imgs = []
+        for color in self.colors:
+            for path in self.imgs_per_color[color]:
+                self.all_imgs.append((path, color))
+
+        print(f"Loaded {len(self.all_imgs)} images from {len(self.colors)} colors.")
+
     def __len__(self):
-        return len(self.img_files)
+        return len(self.all_imgs)
 
     def __getitem__(self, idx):
-        img_path = self.img_files[idx]
-        img = Image.open(img_path).convert("RGB")
-        # Two augmented views
-        return self.transform(img), self.transform(img)
+        img1_path, color = self.all_imgs[idx]
+        img1 = Image.open(img1_path).convert("RGB")
+        img1 = self.transform(img1)
 
-# -----------------------------
-# 2️⃣ Small CNN encoder
-# -----------------------------
+        # pick another image of same color
+        img2_path = self.imgs_per_color[color][torch.randint(len(self.imgs_per_color[color]), (1,)).item()]
+        img2 = Image.open(img2_path).convert("RGB")
+        img2 = self.transform(img2)
+
+        return img1, img2
+
+
+
 class SmallCNN(nn.Module):
-    def __init__(self, out_dim=128):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.AdaptiveAvgPool2d(1)
-        )
-        self.out_dim = out_dim
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return x
-
-# -----------------------------
-# 3️⃣ Projection head (1-2 layer MLP)
-# -----------------------------
-class ProjectionHead(nn.Module):
-    def __init__(self, in_dim=256, hidden_dim=128, out_dim=128):
+    def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)
+        )
+
+    def forward(self, x):
+        x = self.net(x)
+        return x.view(x.size(0), -1)
+
+class ProjectionHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim)
+            nn.Linear(64, 32)
         )
 
     def forward(self, x):
         return self.net(x)
 
-CHECKPOINT_PATH = "simclr_cone_checkpoint.pth"
-
-def save_checkpoint(epoch, encoder, projector, optimizer):
-    torch.save({
-        "epoch": epoch,
-        "encoder": encoder.state_dict(),
-        "projector": projector.state_dict(),
-        "optimizer": optimizer.state_dict()
-    }, CHECKPOINT_PATH)
-
-
-def load_checkpoint(encoder, projector, optimizer, device):
-    if not os.path.exists(CHECKPOINT_PATH):
-        return 0
-
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
-    encoder.load_state_dict(ckpt["encoder"])
-    projector.load_state_dict(ckpt["projector"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-
-    print(f"✅ Loaded checkpoint from epoch {ckpt['epoch']}")
-    return ckpt["epoch"]
-# -----------------------------
-# 4️⃣ NT-Xent Loss
-# -----------------------------
-def nt_xent_loss(z1, z2, temperature=0.5):
-    batch_size = z1.size(0)
-    # L2 normalize embeddings
+# =============================
+# LOSSES & METRICS
+# =============================
+def nt_xent_loss(z1, z2, temperature):
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
 
+    N = z1.size(0)
     z = torch.cat([z1, z2], dim=0)
-    sim_matrix = torch.matmul(z, z.T) / temperature
+    sim = torch.matmul(z, z.T) / temperature
 
-    # mask out self-similarity
-    mask = (~torch.eye(2*batch_size, 2*batch_size, dtype=bool)).to(z.device)
-    sim_matrix = sim_matrix.masked_select(mask).view(2*batch_size, -1)
+    mask = ~torch.eye(2*N, device=z.device).bool()
+    sim = sim.masked_select(mask).view(2*N, -1)
 
-    # positive similarities
-    pos_sim = torch.sum(z1 * z2, dim=1) / temperature
-    pos_sim = torch.cat([pos_sim, pos_sim], dim=0)
+    pos = torch.sum(z1 * z2, dim=1) / temperature
+    pos = torch.cat([pos, pos], dim=0)
 
-    loss = -torch.log(torch.exp(pos_sim) / torch.sum(torch.exp(sim_matrix), dim=1))
+    loss = -torch.log(torch.exp(pos) / torch.sum(torch.exp(sim), dim=1))
     return loss.mean()
 
+def alignment(z1, z2):
+    return torch.mean(torch.norm(z1 - z2, dim=1) ** 2).item()
 
-# -----------------------------
-# 5️⃣ Training loop
-# -----------------------------
-def train_simclr(img_dir, epochs=100, batch_size=16, lr=1e-4, device="cpu"):
-    dataset = ConeDataset(img_dir)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+def uniformity(z):
+    sq_pdist = torch.pdist(z, p=2).pow(2)
+    return torch.log(torch.mean(torch.exp(-2 * sq_pdist))).item()
 
-    encoder = SmallCNN().to(device)
-    projector = ProjectionHead().to(device)
+# =============================
+# DEBUG IMAGE SAVING
+# =============================
+def save_debug_samples(epoch, encoder, projector, dataset):
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    out = os.path.join(DEBUG_DIR, f"epoch_{epoch:03d}")
+    os.makedirs(out, exist_ok=True)
 
-    optimizer = torch.optim.Adam(
+    encoder.eval()
+    projector.eval()
+
+    with torch.no_grad():
+        for i in range(DEBUG_K):
+            x1, x2 = dataset[i]
+            x1 = x1.unsqueeze(0).to(DEVICE)
+            x2 = x2.unsqueeze(0).to(DEVICE)
+
+            z1 = F.normalize(projector(encoder(x1)), dim=1)
+            z2 = F.normalize(projector(encoder(x2)), dim=1)
+
+            sim = torch.sum(z1 * z2).item()
+
+            save_image(x1, f"{out}/img_{i}_view1.png")
+            save_image(x2, f"{out}/img_{i}_view2.png")
+
+            with open(f"{out}/sim.txt", "a") as f:
+                f.write(f"Image {i}: cosine similarity = {sim:.4f}\n")
+
+# =============================
+# TRAINING
+# =============================
+def train():
+    dataset = ColourDataset(IMG_DIR)
+    val_size = int(len(dataset) * VAL_SPLIT)
+    train_set, val_set = random_split(dataset, [len(dataset)-val_size, val_size])
+
+    train_loader = DataLoader(train_set, BATCH_SIZE, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_set, BATCH_SIZE, shuffle=False)
+
+    encoder = SmallCNN().to(DEVICE)
+    projector = ProjectionHead().to(DEVICE)
+
+    opt = torch.optim.Adam(
         list(encoder.parameters()) + list(projector.parameters()),
-        lr=lr,
-        weight_decay=1e-4
+        lr=LR, weight_decay=1e-4
     )
 
-    start_epoch = load_checkpoint(encoder, projector, optimizer, device)
+    metrics = []
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(1, EPOCHS + 1):
         encoder.train()
         projector.train()
 
-        total_loss = 0
-        for x1, x2 in loader:
-            x1, x2 = x1.to(device), x2.to(device)
+        loss_sum = 0
+        grad_sum = 0
+        pos_sim_sum = 0
+        neg_sim_sum = 0
+
+        for x1, x2 in train_loader:
+            x1, x2 = x1.to(DEVICE), x2.to(DEVICE)
 
             z1 = projector(encoder(x1))
             z2 = projector(encoder(x2))
 
-            loss = nt_xent_loss(z1, z2)
+            loss = nt_xent_loss(z1, z2, TEMPERATURE)
 
-            optimizer.zero_grad()
+            opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(projector.parameters()),
-                5.0
+            grad = torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(projector.parameters()), 5.0
             )
-            optimizer.step()
+            opt.step()
 
-            total_loss += loss.item()
+            z1n = F.normalize(z1, dim=1)
+            z2n = F.normalize(z2, dim=1)
 
-        avg_loss = total_loss / len(loader)
-        print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f}")
+            pos_sim_sum += torch.mean(torch.sum(z1n * z2n, dim=1)).item()
+            neg_sim_sum += torch.mean(torch.mm(z1n, z2n.T)).item()
 
-        save_checkpoint(epoch + 1, encoder, projector, optimizer)
+            loss_sum += loss.item()
+            grad_sum += grad
 
-    return encoder
+        encoder.eval()
+        projector.eval()
+        val_loss = 0
 
-# -----------------------------
-# 6️⃣ Example usage
-# -----------------------------
+        with torch.no_grad():
+            for x1, x2 in val_loader:
+                x1, x2 = x1.to(DEVICE), x2.to(DEVICE)
+                val_loss += nt_xent_loss(
+                    projector(encoder(x1)),
+                    projector(encoder(x2)),
+                    TEMPERATURE
+                ).item()
+
+        record = {
+            "epoch": epoch,
+            "train_loss": float(loss_sum / len(train_loader)),
+            "val_loss": float(val_loss / len(val_loader)),
+            "pos_cos_sim": float(pos_sim_sum / len(train_loader)),
+            "neg_cos_sim": float(neg_sim_sum / len(train_loader)),
+            "embedding_variance": torch.var(z1n, dim=0).mean().item(),
+            "alignment": alignment(z1n, z2n),
+            "uniformity": uniformity(torch.cat([z1n, z2n], dim=0)),
+            "grad_norm": float(grad_sum / len(train_loader)),
+            "lr": float(opt.param_groups[0]["lr"]),
+            "time": datetime.now().isoformat()
+        }
 
 
+        metrics.append(record)
+
+        with open(METRICS_PATH, "w") as f:
+            json.dump(metrics, f, indent=2)
+
+        torch.save({
+            "encoder": encoder.state_dict(),
+            "projector": projector.state_dict(),
+            "epoch": epoch
+        }, CHECKPOINT_PATH)
+
+        print(f"Epoch {epoch:03d} | "
+              f"Loss {record['train_loss']:.3f} | "
+              f"PosSim {record['pos_cos_sim']:.3f} | "
+              f"Val {record['val_loss']:.3f}")
+
+        if epoch % DEBUG_EVERY == 0:
+            save_debug_samples(epoch, encoder, projector, dataset)
+
+# =============================
+# RUN
+# =============================
 if __name__ == "__main__":
-    device = "cpu"
-    encoder = train_simclr("/home/specapoorv/irc-cv-stack/data/cropped_imgs")
-    # Now you can get embeddings for two images and compute similarity
+    train()

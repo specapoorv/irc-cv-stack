@@ -139,8 +139,6 @@ class YoloPub(Node):
     def chi_square(self, h1, h2, eps=1e-10):
         return 0.5 * np.sum((h1 - h2) ** 2 / (h1 + h2 + eps))
 
-    
-
     def process(self):
         '''
         runs yolo basically and saves data in self.save_data

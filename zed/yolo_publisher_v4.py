@@ -3,7 +3,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Bool
 from sensor_msgs.msg import Image, NavSatFix
 from std_srvs.srv import Trigger
-from rcl_interfaces.msg import ParameterEvent
+from rcl_interfaces.msg import SetParametersResult
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -93,7 +93,7 @@ class YoloPub(Node):
 
         # Load encoder checkpoint
         self.cnn = SimpleCNN().to(self.device)
-        cnn_checkpoint_path = "best_cnn_retinex_2.pth"
+        cnn_checkpoint_path = "./weights/best_cnn_retinex_2.pth"
         self.cnn.load_state_dict(torch.load(cnn_checkpoint_path, map_location=self.device))
         self.cnn.eval()
         self.get_logger().warn(f"[DEPLOY] CNN colour classifier deployed successfully!")
@@ -113,8 +113,9 @@ class YoloPub(Node):
         self.sub_state = self.create_subscription(Bool, "/state", self.state_callback, 10)
         self.sub_gps = self.create_subscription(NavSatFix, "/gps/fix", self.gps_callback, 10)
 
+        #Service and Param
         self.log_service = self.create_service(Trigger, "log_service", self.log_callback)
-        self.declare_parameter("/colour_override", "None")
+        self.declare_parameter("colour_override", "None")
         self.add_on_set_parameters_callback(self.colour_override_callback)
 
         self.pub = self.create_publisher(Float32MultiArray, "/cone_bbox", 10)
@@ -135,18 +136,12 @@ class YoloPub(Node):
 
         self.colour_to_go_to = None
 
-
+                  
     def left_callback(self, msg):
-        try:
-            self.left_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().warn(f"Exception: {e}")
+        self.left_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
     def depth_callback(self, msg):
-        try:
-            self.depth_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")  
-        except Exception as e:
-            self.get_logger().warn(f"Exception: {e}")
+        self.depth_frame = self.bridge.imgmsg_to_cv2(msg, msg.encoding)  
     
     def state_callback(self, msg):
         self.state = msg.data
@@ -207,9 +202,6 @@ class YoloPub(Node):
                 min_z = z
                 cone_to_log_idx = i 
 
-        if cone_to_log_idx is None:
-            self.get_logger().info("That thing that was None is now None")
-
         cx, cy, z, colour_name, colour_conf = self.save_data[cone_to_log_idx]
 
         self.get_logger().info("Preparing to log GPS coords.....")
@@ -256,12 +248,12 @@ class YoloPub(Node):
                 else:
                     self.colour_to_go_to = param.value.lower()
                     self.get_logger().info(f"{MAGENTA}Manual override set to: {self.colour_to_go_to}{RESET}")
-        return rclpy.parameter.SetParametersResult(successful=True)
+        return SetParametersResult(successful=True)
 
     #HELPERS
     
-    # def euclidean(self, p, q):
-    #     return sum((a - b) ** 2 for a, b in zip(p, q))
+    def euclidean(self, p, q):
+        return sum((a - b) ** 2 for a, b in zip(p, q))
     
     
     def reset_target(self):
@@ -302,7 +294,6 @@ class YoloPub(Node):
             dpatch = dpatch[np.isfinite(dpatch)]
             if len(dpatch) == 0:
                 continue
-
             z = float(np.median(dpatch))
 
             #if aspect ratio is fcked up, skip
@@ -355,7 +346,7 @@ class YoloPub(Node):
             if self.colour_to_go_to is None:
                 self.get_logger().info(f"{YELLOW}give me colour to go to babygirl{RESET}")
                 return
-
+1
         # Filter cones by colour match
         filterd_bbox_per_frame = []
         for cone in self.save_data:
@@ -369,6 +360,7 @@ class YoloPub(Node):
                 filterd_bbox_per_frame.append([cx, cy, z, colour_conf])
 
         #now we will filter all bbox per frame, such that only bbox whose embedding lie within a threshold (cosine similarity) exist and then just pick the lowest z valu
+
 
         if len(filterd_bbox_per_frame) == 0:
             self.get_logger().info(f"{RED}No matching cones found after filtering{RESET}")
@@ -395,20 +387,22 @@ class YoloPub(Node):
 
     
     def timer_callback(self):
+        self.state = True
         if self.left_frame is None:
             self.get_logger().info(f"{CYAN}[WAITING] for zed boi to give frames, TURN ON ZEDWRAPPER{RESET}")
 
         if self.depth_frame is None:
-            self.get_logger().info("[WAITING] for zed depth image")
-           
+            self.get_logger().info(f"{CYAN}[WAITING] for zed depth image")
+        
         if self.state != self.last_state:
             if self.state:
                 self.get_logger().info(f"{MAGENTA}{BOLD}[AUTONOMOUS MODE]{RESET}")
+                self.get_logger().info(f"{BOLD}TARGET CONE : {self.colour_to_go_to}")
+
 
             else:
                 self.get_logger().info(f"{RED}{BOLD}[MANUAL MODE]{RESET}")
                 self.reset_target() #resets embedding_to_go_to
-
             self.last_state = self.state
 
         if self.state:
