@@ -1,1 +1,1 @@
-latest : yolo_publisher_v3.py
+latest : yolo_publisher_v4.py
