@@ -3,6 +3,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Bool
 from sensor_msgs.msg import Image, NavSatFix
 from std_srvs.srv import Trigger
+from rcl_interfaces.msg import ParameterEvent
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -59,7 +60,7 @@ def msrcr(img, sigmas=(15, 80, 250), alpha=125, beta=46):
 
     
 class SimpleCNN(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self):
         super(SimpleCNN, self).__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
@@ -82,16 +83,17 @@ class YoloPub(Node):
         super().__init__("yolo_publisher")
 
         self.bridge = CvBridge()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.model = YOLO("./weights/model_inside.pt")
-        self.model.to("cuda")
+        self.model.to(self.device)
         print(torch.cuda.is_available())
         self.get_logger().warn(f"[DEPLOY] yolo deployed on device : {self.model.device} succesfully!")
 
         # Load encoder checkpoint
-        self.cnn = SimpleCNN(num_classes=6).to("cuda")
+        self.cnn = SimpleCNN().to(self.device)
         cnn_checkpoint_path = "best_cnn_retinex_2.pth"
-        self.cnn.load_state_dict(torch.load(cnn_checkpoint_path, map_location="cuda"))
+        self.cnn.load_state_dict(torch.load(cnn_checkpoint_path, map_location=self.device))
         self.cnn.eval()
         self.get_logger().warn(f"[DEPLOY] CNN colour classifier deployed successfully!")
 
@@ -111,6 +113,8 @@ class YoloPub(Node):
         self.sub_gps = self.create_subscription(NavSatFix, "/gps/fix", self.gps_callback, 10)
 
         self.log_service = self.create_service(Trigger, "log_service", self.log_callback)
+        self.declare_parameter("/colour_override", "None")
+        self.add_on_set_parameters_callback(self.colour_override_callback)
 
         self.pub = self.create_publisher(Float32MultiArray, "/cone_bbox", 10)
 
@@ -157,7 +161,7 @@ class YoloPub(Node):
             # Convert to PIL and transform
             image_rgb = cv2.cvtColor(retinex_img, cv2.COLOR_BGR2RGB)
             pil_img = PILImage.fromarray(image_rgb)
-            img_tensor = self.cnn_transform(pil_img).unsqueeze(0).to("cuda")
+            img_tensor = self.cnn_transform(pil_img).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
                 logits = self.cnn(img_tensor)
@@ -233,6 +237,20 @@ class YoloPub(Node):
 
 
         return response
+    
+    def colour_override_callback(self, params):
+        """
+        Called whenever a parameter is changed.
+        """
+        for param in params:
+            if param.name == "colour_override":
+                if param.value.lower() == "none":
+                    self.colour_to_go_to = None
+                    self.get_logger().info(f"{YELLOW}Manual override cleared{RESET}")
+                else:
+                    self.colour_to_go_to = param.value.lower()
+                    self.get_logger().info(f"{MAGENTA}Manual override set to: {self.colour_to_go_to}{RESET}")
+        return rclpy.parameter.SetParametersResult(successful=True)
 
     #HELPERS
     
